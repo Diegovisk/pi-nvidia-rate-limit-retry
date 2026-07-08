@@ -1,0 +1,13 @@
+# Node
+node_modules/
+npm-debug.log*
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Build artifacts (currently not used, but ready if you add a build step later)
+dist/
+*.tsbuildinfo
