@@ -5,6 +5,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.1] - 2026-07-08
+
+### Fixed (after self-review)
+- **Retry-stacking bug** (the only one that defeated the v2 promise): on final
+  exhaustion the wrapper now emits the errorMessage
+  `"NVIDIA NIM returned N consecutive failures, retry budget spent, no further attempts will help right now"`
+  which does not match `isRetryableAssistantError`'s `RETRYABLE_PROVIDER_ERROR_PATTERN`
+  (verified by Node-side regex test against the source). Without this fix,
+  pi's own retry loop would call `streamSimple` again whenever the
+  upstream 429 text was forwarded, multiplying attempts by `maxRetries=3`.
+- **`startPushed` reset bug**: hoisted out of the per-attempt loop so a
+  retry's `start` event is suppressed when the first attempt already
+  forwarded one. Previously each attempt re-forwarded `start` — protocol
+  violation under pi's event-stream contract.
+- **Abort-before-iteration hang**: replaced the bare `if (signal?.aborted) break;`
+  at the top of the loop with a full `outer.push(aborted)` +
+  `outer.end(aborted.error)` + `return`, matching every other exit path.
+  Without this the outer stream's async iterator could hang forever on a
+  waiter that never resolves.
+- **Abort-listener leak** (minor): `backoffMs` now calls
+  `signal.removeEventListener("abort", onAbort)` in the natural-resolve path
+  via the `onTimer` wrapper. Cumulative listeners across long-lived
+  `ctx.signal` objects no longer accumulate.
+
+### Not changed
+- Inline `createAssistantMessageEventStream` retained: pi's jiti loader
+  aliases `@earendil-works/pi-ai` and `@earendil-works/pi-ai/compat` to
+  `_bundledPiAiCompat` (= `compat.js`), which does NOT re-export
+  `createAssistantMessageEventStream`. Only `@earendil-works/pi-ai/utils/event-stream`
+  has the symbol, and that subpath isn't aliased. Replacing the inline would
+  break loading under pi's actual loader. Verified in
+  `pi-coding-agent/dist/core/extensions/loader.js` lines 10 and 42.
+
 ## [2.0.0] - 2026-07-08
 
 ### Changed (BREAKING)

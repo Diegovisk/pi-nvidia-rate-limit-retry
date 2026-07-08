@@ -89,6 +89,20 @@ The outer `AssistantMessageEventStream` is inlined because `@earendil-works/pi-a
 isn't in pi's jiti alias list, so extensions can't subpath-import it directly. The inline
 copy mirrors the upstream ~70-line implementation byte-for-byte.
 
+## What changed in v2.0.1
+
+- **Retry-stacking fix (critical).** Final exhaustion now emits a sentinel
+  `errorMessage` (`NVIDIA NIM returned N consecutive failures, retry budget
+  spent, no further attempts will help right now`) that does not match
+  pi's `isRetryableAssistantError` regex set. Without this, the original
+  upstream 429 text leaked back into pi's own retry path, multiplying our
+  budget by `maxRetries=3`. The extension now genuinely owns the retry budget.
+- **`startPushed` hoisted** out of the per-attempt loop so retries don't
+  replay the `start` event.
+- **Abort-before-iteration** now pushes a terminal `error` event and `end()`s
+  the outer stream, fixing a latent hang.
+- **`backoffMs` cleanup** — abort listener is detached on natural resolve.
+
 ## What this still does NOT do
 
 - **Does not bypass upstream rate limits** — only retries during the cooldown window.

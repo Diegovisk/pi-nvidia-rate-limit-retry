@@ -1,6 +1,6 @@
 {
   "name": "pi-nvidia-rate-limit-retry",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "pi extension: transparent retries for NVIDIA NIM rate-limit errors",
   "author": "Diegovisk (https://github.com/Diegovisk)",
   "license": "MIT",

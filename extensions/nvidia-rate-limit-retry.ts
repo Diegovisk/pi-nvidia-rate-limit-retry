@@ -59,15 +59,18 @@ function backoffMs(attempt: number, abortSignal?: AbortSignal): Promise<void> {
 			reject(new Error("aborted"));
 			return;
 		}
-		const timer = setTimeout(resolve, delay);
-		abortSignal?.addEventListener(
-			"abort",
-			() => {
-				clearTimeout(timer);
-				reject(new Error("aborted"));
-			},
-			{ once: true },
-		);
+		// We use an `AbortListener` we'd otherwise leak on the resolve path, so
+		// wrap the resolver to detach it once the timer fires naturally.
+		const onAbort = () => {
+			clearTimeout(timer);
+			reject(new Error("aborted"));
+		};
+		const onTimer = () => {
+			abortSignal?.removeEventListener("abort", onAbort);
+			resolve();
+		};
+		const timer = setTimeout(onTimer, delay);
+		abortSignal?.addEventListener("abort", onAbort, { once: true });
 	});
 }
 
@@ -240,12 +243,33 @@ function nvidiaRetryStream(
 	// can iterate events mid-flight.
 	(async () => {
 		let forwardedContent = false;
+		// Hoisted out of the per-attempt loop so a duplicate `start` on retry
+		// (when !forwardedContent) is not re-forwarded. Otherwise the
+		// second forward would be a second stream from the consumer's POV.
+		let startPushed = false;
 
 		for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-			if (signal?.aborted) break;
+			// If the signal lands here, push a terminal error so the outer
+			// stream's async iterator doesn't hang waiting for a waiter to
+			// resolve. Without this, callers would await forever.
+			if (signal?.aborted) {
+				const aborted: AssistantMessageEvent = {
+					type: "error",
+					reason: "aborted",
+					error: {
+						stopReason: "aborted",
+						errorMessage: "aborted",
+						provider: model?.provider,
+						model: model?.id,
+						api: model?.api,
+					},
+				};
+				outer.push(aborted);
+				outer.end(aborted.error);
+				return;
+			}
 
 			let innerError: any | undefined;
-			let startPushed = false;
 
 			// Helper to forward ONE event, deciding per-type whether to drop.
 			const fwd = (ev: AssistantMessageEvent) => {
@@ -339,8 +363,20 @@ function nvidiaRetryStream(
 					reason: "error",
 					error: {
 						...innerError,
+						// WRAP with sentinel text that does NOT match pi's
+						// `isRetryableAssistantError` regex set (rate.?limit,
+						// 429, too many requests, overloaded, server.?error,
+						// timeout, socket hang up, …). Otherwise pi's own retry
+						// loop would call streamSimple again, our wrapper runs
+						// another 20 attempts, and we end up with
+						// `maxRetries=3` x `MAX_ATTEMPTS=20` = 60 attempted
+						// requests on a single turn. This sentinel is the
+						// single line that keeps our "we own the budget"
+						// promise actually true.
 						stopReason: "error",
-						errorMessage: errorMessage ?? "rate limit",
+						errorMessage:
+							`NVIDIA NIM returned ${MAX_ATTEMPTS} consecutive failures, ` +
+							`retry budget spent, no further attempts will help right now`,
 						provider: model?.provider,
 						model: model?.id,
 						api: model?.api,
