@@ -1,0 +1,25 @@
+# Keep these out of the npm tarball.
+# (The "files" array in package.json would do most of this, but .npmignore is
+#  idiomatic and survives `files` changes.)
+
+.git/
+.github/
+.gitattributes
+.gitignore
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Build artifacts (not used today — present for future-proofing)
+dist/
+*.tsbuildinfo
+
+# Internal scripts (push helper for me, not for users)
+scripts/
+
+# npm/debug logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*

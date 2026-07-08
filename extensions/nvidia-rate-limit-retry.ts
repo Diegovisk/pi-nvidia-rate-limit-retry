@@ -1,60 +1,45 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { getApiProvider } from "@earendil-works/pi-ai/compat";
 
-/**
- * NVIDIA NIM Rate Limit Retry Extension
- *
- * NVIDIA NIM models are free but aggressively rate-limited (429s).
- * They usually succeed on retry, but the default retry budget (3 attempts
- * with 2s base backoff) and visible error messages clutter the conversation.
- *
- * WHAT THIS DOES:
- * 1. Intercepts NVIDIA NIM 429/rate-limit errors at message_end
- * 2. Replaces the ugly error text with a compact retry note so session
- *    history stays clean — you see "⏳ NVIDIA rate limit — retry 2/8"
- * 3. Preserves stopReason="error" and errorMessage so pi's built-in retry
- *    system (exponential backoff + agent state cleanup) still works
- * 4. After built-in retries are exhausted, lets the final error through
- *
- * ── RECOMMENDED settings.json ────────────────────────────────────────────────
- * The default retry budget is 3 attempts x 2s base = ~14s total.
- * For NVIDIA NIM (aggressive rate limiting), increase it:
- *
- *   "retry": {
- *     "enabled": true,
- *     "maxRetries": 10,
- *     "baseDelayMs": 2000
- *   }
- *
- * ── RESPONSE TIMES (with default 2s base delay) ──────────────────────────────
- *   Attempt  |  Delay   |  Cumulative
- *   ─────────┼──────────┼─────────────
- *      1     |  2 000ms |    2s
- *      2     |  4 000ms |    6s
- *      3     |  8 000ms |   14s
- *      4     | 16 000ms |   30s
- *      5     | 32 000ms |   62s  (~1 min)
- *      6-100 | 60 000ms |  cap at 1 min each
- *    100     | 60 000ms |  ~100 min max
- */
+// ─── Configuration ───────────────────────────────────────────────────────────
+//
+// Tunable via env vars (no settings.json edit required):
+//   NVIDIA_RETRY_MAX        — max attempts per burst (default 20)
+//   NVIDIA_RETRY_BASE_MS    — base backoff in ms (default 2000)
+//   NVIDIA_RETRY_CAP_MS     — max single-delay in ms (default 60_000)
+//   NVIDIA_RETRY_JITTER     — jitter fraction 0.0–1.0 (default 0.2)
+//
+// 20 attempts with 2s→4s→8s→…→60s capped + 20% jitter lands at ~5–6 min
+// of retry wall-clock after which we give up and surface the error.
 
-// ─── State ───────────────────────────────────────────────────────────────────
+const MAX_ATTEMPTS = parseIntEnv(process.env.NVIDIA_RETRY_MAX, 20);
+const BASE_MS = parseIntEnv(process.env.NVIDIA_RETRY_BASE_MS, 2_000);
+const CAP_MS = parseIntEnv(process.env.NVIDIA_RETRY_CAP_MS, 60_000);
+const JITTER = Math.max(
+	0,
+	Math.min(1, parseFloatEnv(process.env.NVIDIA_RETRY_JITTER, 0.2)),
+);
 
-const STATE = {
-	isNvidiaNim: false,
-	retryCount: 0,
-	maxRetries: 100, // NVIDIA NIM is aggressively rate-limited
-};
+const NVIDIA_PROVIDER_ID = "nvidia";
+const RETRY_TAG = "[nvidia-rate-limit-retry]";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-function isNvidiaProvider(provider: string | undefined): boolean {
-	if (!provider) return false;
-	return /nvidia|nim|nvapi/i.test(provider);
+function parseIntEnv(v: string | undefined, fallback: number): number {
+	if (!v) return fallback;
+	const n = Number.parseInt(v, 10);
+	return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
-function isRateLimitError(msg: { stopReason?: string; errorMessage?: string }): boolean {
-	if (msg.stopReason !== "error" || !msg.errorMessage) return false;
-	const err = msg.errorMessage.toLowerCase();
+function parseFloatEnv(v: string | undefined, fallback: number): number {
+	if (!v) return fallback;
+	const n = Number.parseFloat(v);
+	return Number.isFinite(n) ? n : fallback;
+}
+
+function isRateLimitErrorMessage(text: string | undefined): boolean {
+	if (!text) return false;
+	const err = text.toLowerCase();
 	return (
 		err.includes("429") ||
 		err.includes("rate limit") ||
@@ -64,131 +49,328 @@ function isRateLimitError(msg: { stopReason?: string; errorMessage?: string }): 
 	);
 }
 
+function backoffMs(attempt: number, abortSignal?: AbortSignal): Promise<void> {
+	const ideal = Math.min(CAP_MS, BASE_MS * 2 ** Math.max(0, attempt - 1));
+	const jitterRange = ideal * JITTER;
+	const offset = (Math.random() * 2 - 1) * jitterRange;
+	const delay = Math.max(0, Math.round(ideal + offset));
+	return new Promise<void>((resolve, reject) => {
+		if (abortSignal?.aborted) {
+			reject(new Error("aborted"));
+			return;
+		}
+		const timer = setTimeout(resolve, delay);
+		abortSignal?.addEventListener(
+			"abort",
+			() => {
+				clearTimeout(timer);
+				reject(new Error("aborted"));
+			},
+			{ once: true },
+		);
+	});
+}
+
+// ─── Minimal inline event-stream ─────────────────────────────────────────────
+//
+// We can't subpath-import `@earendil-works/pi-ai/utils/event-stream` here
+// because that path isn't aliased by pi's jiti loader. The class is small
+// enough to inline. Mirrors `AssistantMessageEventStream` byte-for-byte.
+
+type AssistantMessageEvent =
+	| { type: "start"; partial: any }
+	| { type: "text_start"; contentIndex: number; partial: any }
+	| { type: "text_delta"; contentIndex: number; delta: string; partial: any }
+	| { type: "text_end"; contentIndex: number; content: string; partial: any }
+	| { type: "thinking_start"; contentIndex: number; partial: any }
+	| { type: "thinking_delta"; contentIndex: number; delta: string; partial: any }
+	| { type: "thinking_end"; contentIndex: number; content: string; partial: any }
+	| { type: "toolcall_start"; contentIndex: number; partial: any }
+	| { type: "toolcall_delta"; contentIndex: number; delta: string; partial: any }
+	| { type: "toolcall_end"; contentIndex: number; toolCall: any; partial: any }
+	| { type: "done"; reason: "stop" | "length" | "toolUse"; message: any }
+	| { type: "error"; reason: "aborted" | "error"; error: any };
+
+interface OuterStream extends AsyncIterable<AssistantMessageEvent> {
+	push(event: AssistantMessageEvent): void;
+	end(result?: any): void;
+	result(): Promise<any>;
+}
+
+function createAssistantMessageEventStream(): OuterStream {
+	let resolved = false;
+	let resolveResult: (v: any) => void = () => {};
+	const finalResultPromise = new Promise<any>((res) => (resolveResult = res));
+
+	const queue: AssistantMessageEvent[] = [];
+	const waiting: Array<(v: IteratorResult<AssistantMessageEvent>) => void> = [];
+	let done = false;
+
+	const isComplete = (ev: AssistantMessageEvent) => ev.type === "done" || ev.type === "error";
+	const extractResult = (ev: AssistantMessageEvent): any => {
+		if (ev.type === "done") return ev.message;
+		if (ev.type === "error") return ev.error;
+		throw new Error("Unexpected event type for final result");
+	};
+
+	return {
+		push(event) {
+			if (done) return;
+			if (isComplete(event)) {
+				done = true;
+				if (!resolved) {
+					resolved = true;
+					resolveResult(extractResult(event));
+				}
+			}
+			const waiter = waiting.shift();
+			if (waiter) waiter({ value: event, done: false });
+			else queue.push(event);
+		},
+		end(result) {
+			done = true;
+			if (result !== undefined && !resolved) {
+				resolved = true;
+				resolveResult(result);
+			}
+			while (waiting.length > 0) {
+				const waiter = waiting.shift();
+				waiter!({ value: undefined as never, done: true });
+			}
+		},
+		result() {
+			return finalResultPromise;
+		},
+		async *[Symbol.asyncIterator]() {
+			while (true) {
+				if (queue.length > 0) {
+					yield queue.shift()!;
+				} else if (done) {
+					return;
+				} else {
+					const result = await new Promise<IteratorResult<AssistantMessageEvent>>(
+						(resolve) => waiting.push(resolve),
+					);
+					if (result.done) return;
+					yield result.value;
+				}
+			}
+		},
+	};
+}
+
 // ─── Extension ───────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-	let notifiedSettings = false;
-	let startupBannerShown = false;
-	let activeModelProvider: string | undefined;
+	// Capture the original `openai-completions` streamSimple BEFORE we register
+	// our wrapper, because registering replaces the api-registry entry. The
+	// wrapper then gates on `model.provider === "nvidia"` and passes everything
+	// else through to the captured original — keeping openai/deepseek/groq/etc.
+	// behaviour identical.
+	const originalOpenAI = getApiProvider("openai-completions");
+	if (!originalOpenAI || typeof originalOpenAI.streamSimple !== "function") {
+		console.error(
+			`${RETRY_TAG} could not capture original openai-completions streamSimple. ` +
+			"NVIDIA retry wrapper is not active.",
+		);
+		return;
+	}
+	const passthrough: any = originalOpenAI.streamSimple;
 
-	/**
-	 * startup banner — fires once per process.
-	 * If you see this in the logs after `/reload`, the extension is loaded.
-	 */
-	const showStartupBanner = () => {
+	pi.registerProvider(NVIDIA_PROVIDER_ID, {
+		api: "openai-completions",
+		streamSimple: (model: any, context: any, options: any) => {
+			if (model?.provider !== NVIDIA_PROVIDER_ID) {
+				return passthrough(model, context, options);
+			}
+			return nvidiaRetryStream(passthrough, model, context, options);
+		},
+	});
+
+	// One-time startup banner — proof of life after /reload.
+	let startupBannerShown = false;
+	const startupBanner = () => {
 		if (startupBannerShown) return;
 		startupBannerShown = true;
 		console.log(
-			`[nvidia-rate-limit-retry] loaded — active for NVIDIA NIM models ` +
-			`(max ${STATE.maxRetries} retries, exponential backoff up to 60s).`,
-		);
-	};
-
-	/**
-	 * Per-turn banner — fires once on each agent_start while an NVIDIA
-	 * model is selected. If you see this when you send a prompt to an
-	 * NVIDIA model, the extension is wired to model_select + message_end.
-	 */
-	const showActiveBanner = () => {
-		if (!STATE.isNvidiaNim) return;
-		console.log(
-			`[nvidia-rate-limit-retry] active — provider="${activeModelProvider ?? "?"}" ` +
-			`awaiting 429/rate-limit errors.`,
+			`${RETRY_TAG} loaded — NVIDIA NIM retries: ` +
+			`max ${MAX_ATTEMPTS}, base ${BASE_MS}ms, cap ${CAP_MS}ms, jitter ${JITTER * 100}%.`,
 		);
 	};
 
 	pi.on("session_start", async () => {
-		showStartupBanner();
-		STATE.retryCount = 0;
+		startupBanner();
 	});
 
-	/**
-	 * Track whether the active model is NVIDIA NIM so we only
-	 * intercept errors from the right provider.
-	 */
-	pi.on("model_select", async (event) => {
-		activeModelProvider = event.model?.provider;
-		STATE.isNvidiaNim = isNvidiaProvider(activeModelProvider);
-		STATE.retryCount = 0;
+	// Trim the final "gave up" message in the session file so the conversation
+	// stays readable. The wrapper above already prevents every 429 from reaching
+	// pi as an error, so this only fires when MAX_ATTEMPTS is hit.
+	pi.on("message_end", async (event) => {
+		const msg = event.message as any;
+		if (!msg || msg.role !== "assistant") return;
+		if (msg.stopReason !== "error") return;
+		const provider = msg.provider as string | undefined;
+		if (provider !== NVIDIA_PROVIDER_ID) return;
+		if (!isRateLimitErrorMessage(msg.errorMessage)) return;
 
-		if (STATE.isNvidiaNim && !notifiedSettings) {
-			notifiedSettings = true;
-
-			const msg =
-				"[nvidia-rate-limit-retry] NVIDIA NIM detected. " +
-				"For more aggressive retries, add this to ~/.pi/config/settings.json:\n" +
-				'  "retry": { "enabled": true, "maxRetries": 10, "baseDelayMs": 2000 }\n';
-			console.log(msg);
-		}
-	});
-
-	pi.on("agent_start", async () => {
-		showStartupBanner();
-		showActiveBanner();
-	});
-
-	/**
-	 * Intercept assistant error messages from NVIDIA NIM.
-	 *
-	 * This runs AFTER pi's sessionManager.appendMessage() call, so the
-	 * agent state already has the error recorded. We replace the visible
-	 * text content while keeping stopReason + errorMessage intact, which
-	 * lets pi's built-in retry system (exponential backoff + agent state
-	 * cleanup) proceed normally.
-	 *
-	 * The session file stores the REPLACED message (clean text).
-	 */
-	pi.on("message_end", async (_event) => {
-		const msg = _event.message;
-
-		// Only intercept assistant error messages
-		if (msg.role !== "assistant" || msg.stopReason !== "error" || !msg.errorMessage) {
-			return;
-		}
-
-		// Only handle NVIDIA NIM rate limits
-		if (!STATE.isNvidiaNim || !isRateLimitError(msg)) {
-			return;
-		}
-
-		STATE.retryCount++;
-
-		if (STATE.retryCount > STATE.maxRetries) {
-			console.log(
-				`[nvidia-rate-limit-retry] ${STATE.retryCount - 1} retries exhausted. ` +
-				`Giving up: ${msg.errorMessage.slice(0, 120)}`,
-			);
-			STATE.retryCount = 0;
-			return; // let the full error show through
-		}
-
-		const label = `${STATE.retryCount}/${STATE.maxRetries}`;
-
-		// Keep stopReason="error" + errorMessage so built-in retry fires.
-		// Only replace the visible text with a compact indicator.
+		const fallthrough =
+			`⏳ _NVIDIA rate limit — gave up after ${MAX_ATTEMPTS} retries on the same request. ` +
+			`Try again in a minute or switch models._`;
 		return {
 			message: {
 				...msg,
-				content: [{
-					type: "text" as const,
-					text: `⏳ _NVIDIA rate limit — retry ${label}_`,
-				}],
+				content: [{ type: "text" as const, text: fallthrough }],
 			},
 		};
 	});
+}
 
-	/**
-	 * Reset the retry budget after a successful assistant response,
-	 * so the next burst of rate limits gets full retries.
-	 */
-	pi.on("message_end", async (_event) => {
-		const msg = _event.message;
-		if (msg.role !== "assistant") return;
-		if (msg.stopReason !== "error" && STATE.retryCount > 0) {
+// ─── Stream wrapper ──────────────────────────────────────────────────────────
+
+function nvidiaRetryStream(
+	passthrough: (model: any, context: any, options: any) => any,
+	model: any,
+	context: any,
+	options: any,
+): any {
+	const outer = createAssistantMessageEventStream();
+	const signal: AbortSignal | undefined = options?.signal;
+
+	// Drive the loop async. The outer stream returns immediately so callers
+	// can iterate events mid-flight.
+	(async () => {
+		let forwardedContent = false;
+
+		for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+			if (signal?.aborted) break;
+
+			let innerError: any | undefined;
+			let startPushed = false;
+
+			// Helper to forward ONE event, deciding per-type whether to drop.
+			const fwd = (ev: AssistantMessageEvent) => {
+				if (ev.type === "start") {
+					if (startPushed) return; // only first start gets through
+					startPushed = true;
+					outer.push(ev);
+					return;
+				}
+				if (
+					ev.type === "text_start" ||
+					ev.type === "text_delta" ||
+					ev.type === "text_end" ||
+					ev.type === "thinking_start" ||
+					ev.type === "thinking_delta" ||
+					ev.type === "thinking_end" ||
+					ev.type === "toolcall_start" ||
+					ev.type === "toolcall_delta" ||
+					ev.type === "toolcall_end"
+				) {
+					forwardedContent = true;
+					outer.push(ev);
+					return;
+				}
+				outer.push(ev);
+			};
+
+			try {
+				const inner = passthrough(model, context, {
+					...options,
+					maxRetries: 0, // Force sub-SDK retries off; we own the budget.
+				});
+
+				for await (const ev of inner as AsyncIterable<AssistantMessageEvent>) {
+					fwd(ev);
+					if (ev.type === "done") {
+						outer.end(ev.message);
+						return;
+					}
+					if (ev.type === "error") {
+						innerError = ev.error;
+						break;
+					}
+				}
+			} catch (err) {
+				innerError = err && typeof err === "object"
+					? err
+					: { stopReason: "error", errorMessage: String(err) };
+			}
+
+			if (!innerError) {
+				innerError = {
+					stopReason: "error",
+					errorMessage: "stream closed without done or error",
+				};
+			}
+
+			const errorMessage: string | undefined = innerError?.errorMessage;
+			const is429 = isRateLimitErrorMessage(errorMessage);
+
+			// Only retry on rate limits that arrived BEFORE content.
+			if (!is429 || forwardedContent) {
+				const reason =
+					innerError?.stopReason === "aborted" ? "aborted" : "error";
+				const errMsg: AssistantMessageEvent = {
+					type: "error",
+					reason,
+					error: {
+						...innerError,
+						stopReason: reason,
+						errorMessage: errorMessage ?? "unknown error",
+						provider: model?.provider,
+						model: model?.id,
+						api: model?.api,
+					},
+				};
+				outer.push(errMsg);
+				outer.end(errMsg.error);
+				return;
+			}
+
+			const isLast = attempt >= MAX_ATTEMPTS;
+			const remaining = MAX_ATTEMPTS - attempt;
 			console.log(
-				`[nvidia-rate-limit-retry] Success after ${STATE.retryCount} retries. Budget reset.`,
+				`${RETRY_TAG} ${model?.id ?? "<model>"} — 429 on attempt ${attempt}/${MAX_ATTEMPTS}; ` +
+				`${isLast ? "giving up." : `${remaining} attempt(s) left after backoff.`}`,
 			);
-			STATE.retryCount = 0;
+			if (isLast) {
+				const errMsg: AssistantMessageEvent = {
+					type: "error",
+					reason: "error",
+					error: {
+						...innerError,
+						stopReason: "error",
+						errorMessage: errorMessage ?? "rate limit",
+						provider: model?.provider,
+						model: model?.id,
+						api: model?.api,
+					},
+				};
+				outer.push(errMsg);
+				outer.end(errMsg.error);
+				return;
+			}
+
+			try {
+				await backoffMs(attempt, signal);
+			} catch {
+				const errMsg: AssistantMessageEvent = {
+					type: "error",
+					reason: "aborted",
+					error: {
+						stopReason: "aborted",
+						errorMessage: "aborted",
+						provider: model?.provider,
+						model: model?.id,
+						api: model?.api,
+					},
+				};
+				outer.push(errMsg);
+				outer.end(errMsg.error);
+				return;
+			}
 		}
-	});
+	})();
+
+	return outer;
 }

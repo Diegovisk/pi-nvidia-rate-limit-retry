@@ -1,177 +1,126 @@
 # pi-nvidia-rate-limit-retry
 
 A [pi](https://github.com/eartheater/pi-coding-agent) extension that transparently retries
-NVIDIA NIM rate-limit errors and keeps them out of your session history.
+NVIDIA NIM rate-limit errors at the stream layer.
 
 NVIDIA NIM models are free but aggressively rate-limited (HTTP 429). Calls that fail on the
-first attempt almost always succeed on retry, but pi's default retry budget (3 attempts) is
-too low, and the raw error blobs clutter your context.
+first attempt almost always succeed on retry — but pi's built-in retry budget (3 attempts)
+gives up long before the rate-limit window clears.
 
-This extension:
+## What this does
 
-- **Intercepts** assistant error messages from the `nvidia` provider that match `429`,
-  `rate limit`, `too many requests`, `throttle`, or `please wait`.
-- **Replaces** the ugly error text with a compact indicator so your session file stays clean:
-  `⏳ _NVIDIA rate limit — retry 3/100_`
-- **Preserves** `stopReason="error"` and `errorMessage` so pi's built-in retry system
-  (exponential backoff + agent-state cleanup) still runs.
-- **Loosens** the retry budget by counting retries independently — up to **100 attempts**
-  per error burst before giving up.
+When you send a prompt that hits a NVIDIA NIM 429, this extension:
 
----
+1. **Holds the stream.** The wrapper captures `assistantMessageEventStream` from the openai-completions layer before any token reaches pi.
+2. **Retries with exponential backoff** — 2s, 4s, 8s, 16s, 32s, capped at 60s, with ±20% jitter. Up to **20 attempts** by default (~5–6 min wall-clock) before giving up.
+3. **Only retries rate-limit errors that arrive before any content** — if the model already started streaming, we don't replay a partial response.
+4. **Doesn't touch context overflow, auth errors, or non-NVIDIA providers.** Anything other than 429/rate-limit falls through unchanged. Other providers (openai/deepseek/groq via OpenAI-compatible APIs) are also untouched thanks to `model.provider === "nvidia"` gating.
+5. **Keeps your session history clean.** Successful retries look identical to a successful first try — no `⏳ retry N/100` clutter in the conversation. Only the final "we gave up" surface is rewritten.
+
+## Configure (env vars, no settings.json edit needed)
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `NVIDIA_RETRY_MAX` | 20 | Max attempts per burst before giving up |
+| `NVIDIA_RETRY_BASE_MS` | 2000 | Base backoff in milliseconds |
+| `NVIDIA_RETRY_CAP_MS` | 60000 | Maximum single-delay in milliseconds |
+| `NVIDIA_RETRY_JITTER` | 0.2 | Jitter fraction (0.0–1.0) applied to each delay |
 
 ## Install
 
-### Option 1 — install via git URL (recommended)
+### Option 1 — install via git URL
 
 ```bash
-pi install git:github.com/<owner>/pi-nvidia-rate-limit-retry@v1
+pi install git:github.com/Diegovisk/pi-nvidia-rate-limit-retry@v2
 ```
-
-Replace `<owner>` with the GitHub user/org that hosts this repo.
 
 ### Option 2 — drop the file directly
 
-Copy `extensions/nvidia-rate-limit-retry.ts` to one of pi's auto-discovered extension
-locations, then `/reload`:
-
 ```bash
-# Global (every project)
 cp extensions/nvidia-rate-limit-retry.ts ~/.pi/agent/extensions/
-
-# Project-local (this repo only)
-mkdir -p .pi/extensions && cp extensions/nvidia-rate-limit-retry.ts .pi/extensions/
 ```
 
-Then in pi:
-
-```
-/reload
-```
-
----
+Then `/reload`.
 
 ## Verify it's working
 
-After install (or after `/reload`):
+After `/reload`:
 
-1. Select any NVIDIA NIM model (`/model`, pick an `nvidia/...` entry).
-2. Send a prompt.
-3. Watch your pi terminal stderr / logs. You should see **exactly one line per process**:
+1. Watch stderr for the startup line:
    ```
-   [nvidia-rate-limit-retry] loaded — active for NVIDIA NIM models (max 100 retries, exponential backoff up to 60s).
+   [nvidia-rate-limit-retry] loaded — NVIDIA NIM retries: max 20, base 2000ms, cap 60000ms, jitter 20%.
    ```
-4. And **one line per turn** while the NVIDIA provider is active:
+2. Send a prompt to an NVIDIA model. If a 429 hits, you'll see one log line per retry attempt:
    ```
-   [nvidia-rate-limit-retry] active — provider="nvidia" awaiting 429/rate-limit errors.
+   [nvidia-rate-limit-retry] qwen/qwen3.5-122b-a10b — 429 on attempt 1/20; 19 attempt(s) left after backoff.
    ```
-5. When an actual rate limit fires, you'll see a compact line in the conversation instead
-   of the full error blob:
-   ```
-   ⏳ _NVIDIA rate limit — retry 3/100_
-   ```
+3. The conversation itself stays clean — no `⏳ retry` markers unless we ultimately give up.
 
-If you don't see the startup banner after `/reload`, the extension isn't loaded — see
-[Troubleshooting](#troubleshooting).
+If you don't see the startup banner after `/reload`, the extension isn't loaded (see Troubleshooting).
 
----
+## How it works (architecture)
 
-## Recommended settings
+### Why this couldn't be a `message_end` patch
 
-The extension changes the **per-burst** retry budget it tracks itself, but pi's **built-in**
-retry settings still gate how many *real* attempts are made. Default is 3 attempts with a
-2s base delay. For NVIDIA NIM, bump it:
+Pi's built-in retry budget is read once from `SettingsManager.getRetrySettings()` inside
+`agent-session.js#_prepareRetry`. The SettingsManager exposes only `setRetryEnabled(boolean)`
+to extensions — there's no public setter for `maxRetries` or `baseDelayMs`. That's why
+v1.0.0 (a `message_end` text scrubber) couldn't actually increase the retry count; it
+only cleaned up the post-failure display.
 
-`~/.pi/config/settings.json`:
+### v2.0.0 — stream-layer wrapper
 
-```jsonc
-{
-  "retry": {
-    "enabled": true,
-    "maxRetries": 10,     // default is 3
-    "baseDelayMs": 2000   // already the default; example shown for clarity
-  }
-}
-```
+The wrapper registers a `streamSimple` for the `nvidia` provider via `pi.registerProvider`,
+keyed by `api: "openai-completions"`. The api-registry is keyed by API (not by provider),
+so this intercepts every openai-completions model — but inside the wrapper we gate on
+`model.provider === "nvidia"` and pass everything else through to the original streamer
+(captured via `getApiProvider("openai-completions")` before our wrapper registers).
 
-Response-time table (default 2s base delay, capped at 60s per attempt):
+Each connection attempt:
 
-| Attempt |  Delay   | Cumulative |
-|---------|----------|------------|
-| 1       |  2 000ms |    2s      |
-| 2       |  4 000ms |    6s      |
-| 3       |  8 000ms |   14s      |
-| 4       | 16 000ms |   30s      |
-| 5       | 32 000ms |   62s      |
-| 6 – 100 | 60 000ms |  capped    |
-| 100     | 60 000ms |  ~100 min  |
+1. Calls the original openai-completions streamer with `maxRetries: 0` (so the OpenAI SDK's sub-retry doesn't double-retry on top of ours).
+2. Forwards events to a fresh outer `AssistantMessageEventStream`.
+3. Holds the terminal `done`/`error` event without forwarding yet.
+4. If the terminal is a 429-style error and nothing was forwarded: back off and retry.
+5. If the terminal is `done`: forward it, end the stream. Done.
+6. If the terminal is any other error: forward it verbatim. No replay.
 
-Practically, most NVIDIA rate limits clear in the first 2–3 attempts. The 100-attempt ceiling
-is paranoia for load spikes.
+The outer `AssistantMessageEventStream` is inlined because `@earendil-works/pi-ai/utils/event-stream`
+isn't in pi's jiti alias list, so extensions can't subpath-import it directly. The inline
+copy mirrors the upstream ~70-line implementation byte-for-byte.
 
----
+## What this still does NOT do
 
-## How it works
-
-1. `model_select` — when the active model switches, set a flag if its `provider` matches
-   `/nvidia|nim|nvapi/i`.
-2. `after_provider_response` — log HTTP 429s for debugging.
-3. `message_end` — for assistant messages with `stopReason="error"` where `errorMessage`
-   matches a rate-limit pattern AND the provider is NVIDIA:
-   - increment an internal counter,
-   - return a replacement message with the visible text changed to a small indicator,
-   - **leave `stopReason="error"` and `errorMessage` intact** so pi's retry path fires.
-4. `message_end` (success case) — reset the internal counter so the next burst gets full budget.
-
-The replacement happens before pi's `sessionManager.appendMessage()`, so the cleaned text is
-what lands in the JSONL session file.
-
----
-
-## What this does NOT do
-
-- Does not bypass rate limits — only retries when the upstream API is in cooldown.
-- Does not match NVIDIA models served through **OpenRouter** (provider field is `openrouter`,
-  not `nvidia`). If you want that too, open an issue and we'll broaden the matcher.
-- Does not retry non-rate-limit errors (auth, context overflow, etc.) — those have their own
-  semantics in pi.
-- Does not persist per-project state. Retry budget resets per session.
-
----
+- **Does not bypass upstream rate limits** — only retries during the cooldown window.
+- **Does not match NVIDIA models served through OpenRouter** (provider field is `openrouter`).
+  Open a follow-up if you want that.
+- **Does not retry non-rate-limit errors** — auth, context overflow, etc. propagate verbatim.
+- **Does not persist per-project state** — retry budget is in-memory, fresh per process.
 
 ## Troubleshooting
 
 **No `[loaded]` banner after `/reload`.**
 
-- Check the extension file is in a discovered path:
+- Check the file lives in a discovered path:
   `~/.pi/agent/extensions/` (global) or `.pi/extensions/` (project-local).
-- Run `pi --list-extensions` to confirm it's registered.
-- Check `pi` stderr for TypeScript compile errors (jiti parses the `.ts` directly).
+- Look for TypeScript parse errors on stderr.
 
-**`[loaded]` shows but `[active]` doesn't.**
+**All openai-completions streams broke.**
 
-- You selected a non-NVIDIA model. The extension intentionally stays quiet for other providers.
+The wrapper gates by `model.provider === "nvidia"`, but it overrides the openai-completions
+registration for everyone. If something regresses there, all OpenAI-compatible providers
+(openai/deepseek/groq/etc.) would be affected. Likely cause is a missing or wrong
+`getApiProvider` capture — open an issue with the failure mode.
 
-**You still see full 429 error blobs in the conversation.**
+**Give up happens too quickly / too slowly.**
 
-- The error isn't matching the regex. Look at the raw `errorMessage` in your session log
-  (`.pi/sessions/*.jsonl`) and open an issue with the exact text — we'll broaden the
-  pattern.
-
-**Retries give up after 3 attempts.**
-
-- Bump `retry.maxRetries` in `~/.pi/config/settings.json`. pi's built-in retry is what
-  actually performs the request retry; this extension's 100-counter just controls how long
-  we'll keep scrubbing errors from your session history.
-
----
+Set `NVIDIA_RETRY_MAX` / `NVIDIA_RETRY_BASE_MS` / `NVIDIA_RETRY_CAP_MS` env vars.
 
 ## Compatibility
 
-Tested against `@earendil-works/pi-coding-agent` ≥ 0.80 (uses `model_select`, `message_end`,
-`after_provider_response`, `session_start`, and `agent_start` events).
-
----
+Tested against `@earendil-works/pi-coding-agent` 0.80+. Imports from
+`@earendil-works/pi-ai/compat` (which is pi's jiti-aliased path for the same `compat`
+entry point).
 
 ## License
 

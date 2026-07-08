@@ -1,0 +1,47 @@
+{
+  "name": "pi-nvidia-rate-limit-retry",
+  "version": "2.0.0",
+  "description": "pi extension: transparent retries for NVIDIA NIM rate-limit errors",
+  "author": "Diegovisk (https://github.com/Diegovisk)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Diegovisk/pi-nvidia-rate-limit-retry.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Diegovisk/pi-nvidia-rate-limit-retry/issues"
+  },
+  "homepage": "https://github.com/Diegovisk/pi-nvidia-rate-limit-retry#readme",
+  "keywords": [
+    "pi",
+    "pi-extension",
+    "pi-package",
+    "nvidia",
+    "nvidia-nim",
+    "rate-limit",
+    "retry",
+    "429"
+  ],
+  "type": "module",
+  "scripts": {
+    "clean": "echo 'nothing to clean'",
+    "build": "echo 'nothing to build'",
+    "check": "echo 'nothing to check'",
+    "dry-publish": "npm publish --dry-run --access public"
+  },
+  "files": [
+    "extensions/",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/nvidia-rate-limit-retry.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}
