@@ -223,7 +223,7 @@ export default function (pi: ExtensionAPI) {
 		const provider = msg.provider as string | undefined;
 		if (provider !== NVIDIA_PROVIDER_ID) return;
 		// Match the exhaustion marker emitted by the stream wrapper. Don't
-		// rely on `isRateLimitErrorMessage` here \u2014 the sentinel
+		// rely on `isRateLimitErrorMessage` here -- the sentinel
 		// errorMessage we emit (in `isLast`) deliberately avoids those
 		// substrings so pi won't retry the call. A marker-based check
 		// keeps this rewrite decoupled from the human-readable text.
