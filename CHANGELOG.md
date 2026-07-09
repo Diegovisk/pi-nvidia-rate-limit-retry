@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.3] - 2026-07-09
+
+### Fixed
+- **Provider gate broadened**: the stream wrapper, the `message_end` rewrite,
+  and (where applicable) the rewrite's `EXHAUSTION_MARKER` match all now
+  recognize OpenRouter-routed NVIDIA models as well as direct NVIDIA NIM.
+  Previously the only signal was `model.provider === "nvidia"`, which
+  silently bypassed any NVIDIA model served through OpenRouter. The new
+  predicate matches when **either** `model.provider === "nvidia"` **or**
+  `model.api === "openai-completions"` AND `model.id` starts with
+  `nvidia/` (e.g. `nvidia/nemotron-3-super-120b-a12b:free`). Symptom: in
+  sessions that primarily route NVIDIA calls via OpenRouter, only pi's
+  `Retrying (n/3)` UI bar would appear and our `[nvidia-rate-limit-retry]`
+  log lines would be absent. After this fix, the wrapper absorbs up to
+  `MAX_ATTEMPTS` rate-limit retries across both routing paths and the
+  friendly `⏳ NVIDIA rate limit` caption is rewritten in the session
+  for both routing paths too.
+
 ## [2.0.2] - 2026-07-08
 
 ### Fixed (post-review)

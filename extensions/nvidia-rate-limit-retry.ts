@@ -57,6 +57,27 @@ function isRateLimitErrorMessage(text: string | undefined): boolean {
 	);
 }
 
+/**
+ * Match any call that semantically targets an NVIDIA model. Two shapes:
+ *   1. Direct NVIDIA NIM: `model.provider === "nvidia"`.
+ *   2. NVIDIA models routed through OpenRouter's openai-completions API:
+ *      `model.api === "openai-completions"` AND `model.id` starts with
+ *      `nvidia/` (e.g. `nvidia/nemotron-3-super-120b-a12b:free`).
+ * Without case (2) the wrapper silently bypasses OpenRouter-routed NVIDIA
+ * models and the user sees pi's own 3-retry budget instead of ours
+ * (provider field stays `openrouter`, the model id is the only NVIDIA tell).
+ */
+function isNvidiaCall(
+	model: { provider?: string; api?: string; id?: string } | undefined | null,
+): boolean {
+	if (!model) return false;
+	if (model.provider === NVIDIA_PROVIDER_ID) return true;
+	if (model.api === "openai-completions" && typeof model.id === "string") {
+		return model.id.toLowerCase().startsWith("nvidia/");
+	}
+	return false;
+}
+
 function backoffMs(attempt: number, abortSignal?: AbortSignal): Promise<void> {
 	const ideal = Math.min(CAP_MS, BASE_MS * 2 ** Math.max(0, attempt - 1));
 	const jitterRange = ideal * JITTER;
@@ -191,7 +212,14 @@ export default function (pi: ExtensionAPI) {
 	pi.registerProvider(NVIDIA_PROVIDER_ID, {
 		api: "openai-completions",
 		streamSimple: (model: any, context: any, options: any) => {
-			if (model?.provider !== NVIDIA_PROVIDER_ID) {
+			// Retry only on calls that semantically target an NVIDIA model.
+			// We match two shapes:
+			//   1. Direct NVIDIA NIM: provider === "nvidia".
+			//   2. NVIDIA models routed through OpenRouter: api === "openai-completions"
+			//      AND the model id starts with "nvidia/" (e.g. "nvidia/nemotron-...").
+			// Without the second case our wrapper silently bypasses OpenRouter-routed
+			// NVIDIA models and the user sees pi's own 3-retry budget instead of ours.
+			if (!isNvidiaCall(model)) {
 				return passthrough(model, context, options);
 			}
 			return nvidiaRetryStream(passthrough, model, context, options);
@@ -220,8 +248,10 @@ export default function (pi: ExtensionAPI) {
 		const msg = event.message as any;
 		if (!msg || msg.role !== "assistant") return;
 		if (msg.stopReason !== "error") return;
-		const provider = msg.provider as string | undefined;
-		if (provider !== NVIDIA_PROVIDER_ID) return;
+		// Same gate as the stream wrapper: include OpenRouter-routed NVIDIA models
+		// so their exhaustion captions fire too (otherwise they'd fall back to
+		// pi's "Retry failed after N attempts" surface in the session).
+		if (!isNvidiaCall(msg as any)) return;
 		// Match the exhaustion marker emitted by the stream wrapper. Don't
 		// rely on `isRateLimitErrorMessage` here -- the sentinel
 		// errorMessage we emit (in `isLast`) deliberately avoids those

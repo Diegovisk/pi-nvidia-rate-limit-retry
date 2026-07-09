@@ -175,14 +175,17 @@ documented here for future maintainers.
 ### What this still does NOT do
 
 - **Does not bypass upstream rate limits** — only retries during the cooldown window.
-- **Does not match NVIDIA models served through OpenRouter** (provider field is
-  `openrouter`, not `nvidia`). Open a follow-up if you want that.
 - **Does not retry non-rate-limit errors** — auth, context overflow, etc. propagate
   verbatim.
 - **Does not persist per-project state** — retry budget is in-memory, fresh per process.
 - **Does not require editing `~/.pi/config/settings.json`** — the whole point of replacing
   pi's retry path is that we don't need its budget raised. (This is the v2.x architectural
   shift from v1.x: we own the budget.)
+
+> Note: as of v2.0.3 the wrapper, the rewrite handler, and the EXHAUSTION_MARKER match
+> all recognize **OpenRouter-routed NVIDIA models** as well (matched when
+> `model.id` starts with `nvidia/`). This used to be excluded; the exclusion
+> note above is intentionally left as historical context only.
 
 ## Troubleshooting
 
