@@ -23,6 +23,14 @@ const JITTER = Math.max(
 const NVIDIA_PROVIDER_ID = "nvidia";
 const RETRY_TAG = "[nvidia-rate-limit-retry]";
 
+// Stable marker used as the prefix of the final-exhaustion errorMessage and
+// matched by the `message_end` rewrite handler. MUST NOT contain any substring
+// that pi's `isRetryableAssistantError` retry/non-retry pattern sets match,
+// otherwise pi will re-enter our wrapper or classify the failure as a billing
+// limit. We verified this against the regex sets in
+// `@earendil-works/pi-ai/dist/utils/retry.js`.
+const EXHAUSTION_MARKER = "nvidia-nim-retry-budget-exhausted";
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function parseIntEnv(v: string | undefined, fallback: number): number {
@@ -214,7 +222,12 @@ export default function (pi: ExtensionAPI) {
 		if (msg.stopReason !== "error") return;
 		const provider = msg.provider as string | undefined;
 		if (provider !== NVIDIA_PROVIDER_ID) return;
-		if (!isRateLimitErrorMessage(msg.errorMessage)) return;
+		// Match the exhaustion marker emitted by the stream wrapper. Don't
+		// rely on `isRateLimitErrorMessage` here \u2014 the sentinel
+		// errorMessage we emit (in `isLast`) deliberately avoids those
+		// substrings so pi won't retry the call. A marker-based check
+		// keeps this rewrite decoupled from the human-readable text.
+		if (!msg.errorMessage?.includes(EXHAUSTION_MARKER)) return;
 
 		const fallthrough =
 			`⏳ _NVIDIA rate limit — gave up after ${MAX_ATTEMPTS} retries on the same request. ` +
@@ -370,12 +383,16 @@ function nvidiaRetryStream(
 						// loop would call streamSimple again, our wrapper runs
 						// another 20 attempts, and we end up with
 						// `maxRetries=3` x `MAX_ATTEMPTS=20` = 60 attempted
-						// requests on a single turn. This sentinel is the
+						// requests on a single turn. The EXHAUSTION_MARKER
+						// prefix additionally gives the message_end handler
+						// a stable token to recognize this exact case
+						// (decoupling the rewrite from the human-readable
+						// text and the rate-limit pattern match). This is the
 						// single line that keeps our "we own the budget"
 						// promise actually true.
 						stopReason: "error",
 						errorMessage:
-							`NVIDIA NIM returned ${MAX_ATTEMPTS} consecutive failures, ` +
+							`${EXHAUSTION_MARKER}: ${MAX_ATTEMPTS} consecutive failures, ` +
 							`retry budget spent, no further attempts will help right now`,
 						provider: model?.provider,
 						model: model?.id,

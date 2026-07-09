@@ -5,6 +5,45 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.2] - 2026-07-08
+
+### Fixed (post-review)
+- **`message_end` rewrite is no longer dead code.**
+  v2.0.1's sentinel `errorMessage` ("NVIDIA NIM returned N consecutive failures …")
+  intentionally avoids pi's retryable substrings (429, rate limit, too many requests,
+  overloaded, …) so pi won't re-enter our wrapper. But the `message_end` handler
+  was still filtering on `isRateLimitErrorMessage(msg.errorMessage)`, which is
+  the same substring set the sentinel avoids — so on the primary retry-exhaustion
+  path the handler bailed early and the friendly `⏳ gave up after N retries…`
+  rewrite never fired. Users saw raw sentinel text instead.
+  Worse, the handler *did* fire on rare mid-stream 429s that pass through
+  verbatim — producing the misleading "gave up after N retries" text when no
+  exhaustion actually happened.
+
+  Fix: introduce a stable marker constant
+  `const EXHAUSTION_MARKER = "nvidia-nim-retry-budget-exhausted"` and use it
+  for both sides of the contract:
+  - The `isLast` block prefixes the sentinel errorMessage with `${EXHAUSTION_MARKER}: …`.
+  - The `message_end` handler filters on
+    `msg.errorMessage?.includes(EXHAUSTION_MARKER)` instead of
+    `isRateLimitErrorMessage(msg.errorMessage)`.
+  Verified by Node side that `${EXHAUSTION_MARKER}` text doesn't match pi's
+  `RETRYABLE_PROVIDER_ERROR_PATTERN` (so pi won't retry-stack) and also doesn't
+  match the `NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN` (so pi won't classify
+  it as a billing/hard limit and bypass the retry path differently).
+
+### Not changed
+- Inline `createAssistantMessageEventStream` retained. The reviewer's claim that
+  the bare `@earendil-works/pi-ai` specifier exposes the symbol was re-checked
+  against `pi-coding-agent/dist/core/extensions/loader.js` lines 10 and 42-43:
+  both `@earendil-works/pi-ai` and `@earendil-works/pi-ai/compat` are aliased to
+  `_bundledPiAiCompat` (= `compat.js`), and `compat.js` does NOT re-export
+  `utils/event-stream.js`. The symbol exists on `index.js` but the alias
+  intercepts before Node's resolver can pick a default. So the bare import
+  would fail at module-evaluation time under pi's actual loader. The README's
+  explanation stands: "Extensions resolve the pi-ai root to the compat
+  entrypoint (a strict superset of the core entrypoint)" — loader.js line 38.
+
 ## [2.0.1] - 2026-07-08
 
 ### Fixed (after self-review)
