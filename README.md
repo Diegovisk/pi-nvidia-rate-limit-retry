@@ -1,5 +1,11 @@
 # pi-nvidia-rate-limit-retry
 
+> **Deprecated:** This standalone extension is superseded by
+> [pi-nvidia-nim](https://github.com/Diegovisk/pi-nvidia-nim), which bundles the same
+> rate-limit retry logic plus the full NVIDIA NIM provider, router, and thinking handlers.
+> Do **not** install both — it causes double-wrapping. This repo remains public for
+> reference and for users who only need retry without the full NIM fork.
+
 A [pi](https://github.com/eartheater/pi-coding-agent) extension that transparently retries
 NVIDIA NIM rate-limit errors at the stream layer.
 
@@ -235,6 +241,63 @@ as absence of "429" lines.
 Tested against `@earendil-works/pi-coding-agent` 0.80+. Imports from
 `@earendil-works/pi-ai/compat` (pi's jiti-aliased path) and `@earendil-works/pi-coding-agent`.
 No other runtime dependencies.
+
+## Testing
+
+The repo includes a three-tier harness: unit tests, deterministic mock E2E (no network), and live NVIDIA abuse E2E.
+
+### Run everything
+
+```powershell
+.\scripts\run-rate-limit-test.ps1
+```
+
+Or via npm (uses pi's bundled Node when `PI_NODE` is unset):
+
+```bash
+npm run test:all
+```
+
+The harness launches pi in print mode (`-p`) with `--mode json` avoided on Windows where it can block on stdin. Each run saves stdout/stderr under `tests/logs/<timestamp>/`.
+
+### Individual tiers
+
+| Command | What it does |
+|---------|----------------|
+| `npm run test` | Unit tests only (`extensions/lib/retry-helpers.mjs`) |
+| `npm run test:mock` | Mock 429 injection via `NVIDIA_RETRY_TEST_INJECT_429` |
+| `npm run test:live` | Real NVIDIA API: smoke, 5 parallel prompts, 8 serial RPC prompts |
+| `.\scripts\run-rate-limit-test.ps1 -MockOnly` | Mock tier only |
+| `.\scripts\run-rate-limit-test.ps1 -LiveOnly` | Live tier only |
+| `.\scripts\run-rate-limit-test.ps1 -UnitOnly` | Unit tier only |
+
+### Mock injection (deterministic)
+
+When `NVIDIA_RETRY_TEST_INJECT_429=N` is set, the extension returns synthetic 429 errors for the first N attempts per request, then succeeds without calling the network:
+
+```bash
+NVIDIA_RETRY_TEST_INJECT_429=3 NVIDIA_RETRY_MAX=5 NVIDIA_RETRY_BASE_MS=50 pi ...
+```
+
+### Reading results
+
+Open `tests/logs/<latest>/summary.json`:
+
+- `ok: true` — all hard checks passed
+- `warned` — soft checks (e.g. no live 429 observed off-peak) that did not fail the run
+- Each check has `name`, `pass`, `message`, and `details`
+
+Per-scenario stdout/stderr are saved alongside (`*.stdout.log`, `*.stderr.log`). Look for `[nvidia-rate-limit-retry] loaded` in stderr to confirm the extension is active.
+
+### Environment overrides
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `PI_BIN` | `%USERPROFILE%\AppData\Local\pi-node\current\pi.cmd` | pi executable |
+| `PI_NODE` | pi's bundled `node.exe` | Node for running harness scripts |
+| `PI_TEST_PROVIDER` | `nvidia` | Provider for E2E runs |
+| `PI_TEST_MODEL` | `minimaxai/minimax-m3` | Model for E2E runs |
+| `PI_TEST_LOG_DIR` | auto timestamp under `tests/logs/` | Override log output directory |
 
 ## License
 
